@@ -5,29 +5,42 @@ import struct
 import sys
 import os
 import json
-import shutil
-import tempfile
 from array import array
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
 from PySide6.QtCore import (
     Qt, QTimer, Signal, QPropertyAnimation, QEasingCurve, QRectF, QPointF,
-    QIODevice, QUrl, QThread
+    QIODevice, QUrl, QDate
 )
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush, QPainterPath, QLinearGradient
-from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaPlayer, QAudioOutput
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush, QPainterPath, QLinearGradient, QAction, QIcon
+from PySide6.QtMultimedia import QAudioFormat, QAudioSink
+from PySide6.QtWebEngineCore import QWebEngineSettings
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QLineEdit, QScrollArea, QFrame, QProgressBar,
     QMessageBox, QDialog, QDialogButtonBox, QFormLayout, QCheckBox, QListWidget,
     QListWidgetItem, QSpinBox, QButtonGroup, QGraphicsOpacityEffect, QSlider,
-    QSplitter, QSizePolicy
+    QSplitter, QSizePolicy, QSystemTrayIcon, QStyle, QDateEdit, QMenu
 )
 
 import db
 
 APP_TITLE = "NoToto"
+
+
+def resource_path(name):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+def app_icon():
+    ico = resource_path("app_icon.ico")
+    png = resource_path("app_icon.png")
+    path = ico if os.path.exists(ico) else png
+    return QIcon(path) if os.path.exists(path) else QIcon()
+
 
 THEMES = {
     "strawberry_night": {
@@ -99,6 +112,32 @@ def fmt_duration(seconds):
     mins = max(0, int(seconds)) // 60
     h, m = divmod(mins, 60)
     return f"{h}h {m}m" if h else f"{m}m"
+
+
+def format_task_date(value):
+    value = (value or "").strip()
+    today = datetime.now().date()
+    if not value:
+        return "Today"
+    try:
+        d = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return value
+    if d == today:
+        return "Today"
+    if d.year == today.year:
+        return d.strftime("%d %b")
+    return d.strftime("%d %b %Y")
+
+
+def format_task_date_range(start_value, end_value):
+    start_value = (start_value or "").strip()
+    end_value = (end_value or start_value).strip()
+    if not start_value:
+        return "Today"
+    if not end_value or end_value == start_value:
+        return format_task_date(start_value)
+    return f"{format_task_date(start_value)} → {format_task_date(end_value)}"
 
 
 class Card(QFrame):
@@ -630,6 +669,39 @@ class TaskDialog(QDialog):
         rowlay.addWidget(self.priority)
         form.addRow("CATEGORY / PRIORITY", row)
 
+        startdaterow = QWidget()
+        startdatelay = QHBoxLayout(startdaterow)
+        startdatelay.setContentsMargins(0, 0, 0, 0)
+        startdatelay.setSpacing(10)
+        self.use_today = QCheckBox("Today")
+        self.use_today.setChecked(True)
+        self.start_date = QDateEdit(QDate.currentDate())
+        self.start_date.setCalendarPopup(True)
+        self.start_date.setDisplayFormat("ddd, dd MMM yyyy")
+        self.start_date.setMinimumHeight(42)
+        self.start_date.setEnabled(False)
+        self.use_today.toggled.connect(self._sync_start_date_mode)
+        self.start_date.dateChanged.connect(self._sync_linked_end_date)
+        startdatelay.addWidget(self.use_today)
+        startdatelay.addWidget(self.start_date, 1)
+        form.addRow("START DATE", startdaterow)
+
+        enddaterow = QWidget()
+        enddatelay = QHBoxLayout(enddaterow)
+        enddatelay.setContentsMargins(0, 0, 0, 0)
+        enddatelay.setSpacing(10)
+        self.same_end_date = QCheckBox("Same as start")
+        self.same_end_date.setChecked(True)
+        self.end_date = QDateEdit(QDate.currentDate())
+        self.end_date.setCalendarPopup(True)
+        self.end_date.setDisplayFormat("ddd, dd MMM yyyy")
+        self.end_date.setMinimumHeight(42)
+        self.end_date.setEnabled(False)
+        self.same_end_date.toggled.connect(self._sync_end_date_mode)
+        enddatelay.addWidget(self.same_end_date)
+        enddatelay.addWidget(self.end_date, 1)
+        form.addRow("END DATE", enddaterow)
+
         timerow = QWidget()
         tl = QHBoxLayout(timerow)
         tl.setContentsMargins(0, 0, 0, 0)
@@ -678,6 +750,20 @@ class TaskDialog(QDialog):
 
         if task:
             self.title_edit.setText(task["title"])
+            raw_start_date = (task.get("start_date") or task.get("task_date") or "").strip()
+            raw_end_date = (task.get("end_date") or raw_start_date or "").strip()
+            saved_start_date = QDate.fromString(raw_start_date, "yyyy-MM-dd") if raw_start_date else QDate.currentDate()
+            saved_end_date = QDate.fromString(raw_end_date, "yyyy-MM-dd") if raw_end_date else saved_start_date
+            if not saved_start_date.isValid():
+                saved_start_date = QDate.currentDate()
+            if not saved_end_date.isValid():
+                saved_end_date = saved_start_date
+            self.start_date.setDate(saved_start_date)
+            self.end_date.setDate(saved_end_date)
+            self.use_today.setChecked(saved_start_date == QDate.currentDate())
+            self.same_end_date.setChecked(saved_end_date == saved_start_date)
+            self._sync_start_date_mode(self.use_today.isChecked())
+            self._sync_end_date_mode(self.same_end_date.isChecked())
             self.start_time.set_value(task.get("start_time") or "09:00")
             self.end_time.set_value(task.get("end_time") or "10:00")
             self.est_h.setValue(int(task.get("estimated_minutes", 0)) // 60)
@@ -691,6 +777,12 @@ class TaskDialog(QDialog):
             self.subtasks.items = db.get_subtasks(task["id"])
             self.subtasks.refresh()
         else:
+            self.start_date.setDate(QDate.currentDate())
+            self.end_date.setDate(QDate.currentDate())
+            self.use_today.setChecked(True)
+            self.same_end_date.setChecked(True)
+            self._sync_start_date_mode(True)
+            self._sync_end_date_mode(True)
             self.est_m.setValue(25)
 
         self._fade = QPropertyAnimation(self, b"windowOpacity")
@@ -698,6 +790,21 @@ class TaskDialog(QDialog):
         self._fade.setStartValue(0.0)
         self._fade.setEndValue(1.0)
         self._fade.setEasingCurve(QEasingCurve.OutCubic)
+
+    def _sync_start_date_mode(self, use_today):
+        if use_today:
+            self.start_date.setDate(QDate.currentDate())
+        self.start_date.setEnabled(not use_today)
+        self._sync_linked_end_date()
+
+    def _sync_end_date_mode(self, same_as_start):
+        if same_as_start:
+            self.end_date.setDate(self.start_date.date())
+        self.end_date.setEnabled(not same_as_start)
+
+    def _sync_linked_end_date(self, *_):
+        if self.same_end_date.isChecked():
+            self.end_date.setDate(self.start_date.date())
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -708,11 +815,16 @@ class TaskDialog(QDialog):
         if not self.title_edit.text().strip():
             QMessageBox.warning(self, APP_TITLE, "Please enter a quest title.")
             return
+        if self.end_date.date() < self.start_date.date():
+            QMessageBox.warning(self, APP_TITLE, "End date cannot be before start date.")
+            return
         self.accept()
 
     def value(self):
         return {
             "title": self.title_edit.text().strip(),
+            "start_date": self.start_date.date().toString("yyyy-MM-dd"),
+            "end_date": self.end_date.date().toString("yyyy-MM-dd"),
             "start_time": self.start_time.value(),
             "end_time": self.end_time.value(),
             "estimated_minutes": self.est_h.value() * 60 + self.est_m.value(),
@@ -804,6 +916,10 @@ class TaskCard(Card):
         details = QHBoxLayout()
         details.setSpacing(12)
 
+        date_label = QLabel(f"📅 {format_task_date_range(task.get('start_date') or task.get('task_date'), task.get('end_date'))}")
+        date_label.setObjectName("taskProperty")
+        details.addWidget(date_label)
+
         schedule = task.get("start_time", "") or "—"
         end = task.get("end_time", "") or "—"
         schedule_label = QLabel(f"🕒 {schedule} → {end}")
@@ -890,75 +1006,18 @@ class StatCard(Card):
 
 
 
-class YouTubeAudioResolver(QThread):
-    resolved = Signal(int, str, str, str)
-    failed = Signal(int, str)
-    progress = Signal(int, int)
-
-    def __init__(self, url, generation, parent=None):
-        super().__init__(parent)
-        self.url = url
-        self.generation = generation
-
-    def run(self):
-        download_dir = tempfile.mkdtemp(prefix="nototo-audio-")
-        try:
-            from yt_dlp import YoutubeDL
-            from yt_dlp.utils import DownloadError
-
-            def report_progress(data):
-                if self.isInterruptionRequested():
-                    raise DownloadError("Audio download cancelled")
-                if data.get("status") == "downloading":
-                    total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-                    downloaded = data.get("downloaded_bytes", 0)
-                    percent = int(downloaded * 100 / total) if total else 0
-                    self.progress.emit(self.generation, min(99, percent))
-
-            options = {
-                "format": "bestaudio[ext=m4a]/bestaudio",
-                "outtmpl": os.path.join(download_dir, "audio.%(ext)s"),
-                "quiet": True,
-                "no_warnings": True,
-                "no_color": True,
-                "noplaylist": True,
-                "http_chunk_size": 10 * 1024 * 1024,
-                "socket_timeout": 10,
-                "retries": 1,
-                "extractor_retries": 1,
-                "progress_hooks": [report_progress],
-            }
-            with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(self.url, download=True)
-
-            audio_path = ydl.prepare_filename(info) if info else None
-            if not audio_path or not os.path.isfile(audio_path):
-                raise RuntimeError("The audio download did not produce a playable file.")
-            title = info.get("title") or self.url
-            self.progress.emit(self.generation, 100)
-            self.resolved.emit(self.generation, audio_path, title, download_dir)
-        except Exception as exc:
-            shutil.rmtree(download_dir, ignore_errors=True)
-            self.failed.emit(self.generation, str(exc))
-
-
 class MusicLinkPanel(Card):
-    """Audio-only YouTube/music player using yt-dlp and Qt Multimedia."""
+    """YouTube player backed by Qt WebEngine; no yt-dlp/mpv download step."""
+
     def __init__(self, parent=None):
         super().__init__("musicCard", parent)
 
-        self.player = QMediaPlayer(self)
-        self.audio_output = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio_output)
-        self.player.playbackStateChanged.connect(self._on_playback_state_changed)
-        self.player.errorOccurred.connect(self._on_playback_error)
-
         self.current_url = ""
+        self.current_video_id = ""
         self.is_playing = False
         self.loading = False
-        self._resolve_generation = 0
-        self._resolver_threads = set()
-        self._audio_temp_dirs = set()
+        self._player_ready = False
+        self._pending_autoplay = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 12)
@@ -978,7 +1037,7 @@ class MusicLinkPanel(Card):
         controls.setSpacing(7)
 
         self.url = QLineEdit()
-        self.url.setPlaceholderText("Paste YouTube / audio link…")
+        self.url.setPlaceholderText("Paste YouTube link…")
         self.url.setText(db.get_setting("music_url", ""))
         self.url.returnPressed.connect(self.play_from_input)
         controls.addWidget(self.url, 1)
@@ -1001,7 +1060,6 @@ class MusicLinkPanel(Card):
         self.loop.setChecked(db.get_setting("music_loop", "1") == "1")
         self.loop.toggled.connect(self.set_loop)
         controls.addWidget(self.loop)
-
         root.addLayout(controls)
 
         volume_row = QHBoxLayout()
@@ -1019,148 +1077,368 @@ class MusicLinkPanel(Card):
         root.addWidget(self.track_label)
 
         self.hint = QLabel(
-            "Audio only. yt-dlp downloads audio before playback; no video is downloaded."
+            "Streams through YouTube inside NoToto. No mpv, yt-dlp, ffmpeg, or temporary audio download."
         )
         self.hint.setWordWrap(True)
         self.hint.setObjectName("responsiveHint")
         root.addWidget(self.hint)
 
-        self.audio_output.setVolume(self.volume.value() / 100)
-        self.set_loop(self.loop.isChecked())
+        # Keep a tiny off-screen-ish WebEngine view alive. The player itself is not part
+        # of NoToto's UI; all controls stay in this card.
+        self.web = QWebEngineView(self)
+        self.web.setFixedSize(1, 1)
+        self.web.setMaximumSize(1, 1)
+        self.web.setStyleSheet("background: transparent; border: 0;")
+        self.web.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False
+        )
+        self.web.loadFinished.connect(self._on_web_load_finished)
+        root.addWidget(self.web, 0, Qt.AlignRight)
+
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(700)
+        self.poll_timer.timeout.connect(self._poll_player_state)
+        self.poll_timer.start()
+
+        self._load_player_shell()
+
+    @staticmethod
+    def _extract_youtube_video_id(url):
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+        # Allow pasting a bare 11-character YouTube video id.
+        if len(raw) == 11 and all(ch.isalnum() or ch in "-_" for ch in raw):
+            return raw
+        try:
+            parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+            host = parsed.netloc.lower().split(":", 1)[0]
+            path = parsed.path.strip("/")
+            if host in {"youtu.be", "www.youtu.be"}:
+                return path.split("/", 1)[0]
+            if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+                if path == "watch":
+                    return (parse_qs(parsed.query).get("v") or [""])[0]
+                for prefix in ("shorts/", "embed/", "live/"):
+                    if path.startswith(prefix):
+                        return path[len(prefix):].split("/", 1)[0]
+        except Exception:
+            return ""
+        return ""
+
+    def _load_player_shell(self):
+        html_doc = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>html,body,#player{margin:0;width:1px;height:1px;overflow:hidden;background:#000}</style></head>
+<body>
+<div id="player"></div>
+<script>
+  var player = null;
+  var apiReady = false;
+  var lastError = 0;
+  var tag = document.createElement('script');
+  tag.src = 'https://www.youtube.com/iframe_api';
+  document.head.appendChild(tag);
+  function onYouTubeIframeAPIReady() {
+    apiReady = true;
+    player = new YT.Player('player', {
+      width: '1', height: '1', videoId: '',
+      playerVars: { controls: 0, rel: 0, playsinline: 1, modestbranding: 1 },
+      events: {
+        'onError': function(e) { lastError = e.data || -1; }
+      }
+    });
+  }
+  function ntReady(){ return !!(player && player.loadVideoById); }
+  function ntLoad(id, autoplay, volume, looped){
+    if (!ntReady()) return false;
+    lastError = 0;
+    player.setVolume(volume);
+    player.setLoop(!!looped);
+    if (autoplay) player.loadVideoById(id); else player.cueVideoById(id);
+    return true;
+  }
+  function ntPlay(){ if(ntReady()) player.playVideo(); }
+  function ntPause(){ if(ntReady()) player.pauseVideo(); }
+  function ntStop(){ if(ntReady()) player.stopVideo(); }
+  function ntVolume(v){ if(ntReady()) player.setVolume(v); }
+  function ntLoop(v){ if(ntReady()) player.setLoop(!!v); }
+  function ntState(){
+    if(!ntReady()) return {ready:false,state:-99,title:'',error:lastError};
+    var d = player.getVideoData ? player.getVideoData() : {};
+    return {ready:true,state:player.getPlayerState(),title:(d && d.title)||'',error:lastError};
+  }
+</script>
+</body></html>
+"""
+        self.web.setHtml(html_doc, QUrl("https://www.youtube.com/"))
+
+    def _on_web_load_finished(self, ok):
+        if not ok:
+            self.state.setText("YouTube player failed")
+            self.hint.setText("Qt WebEngine could not load the embedded YouTube player.")
+            return
+        self._wait_until_player_ready()
+
+    def _wait_until_player_ready(self):
+        self.web.page().runJavaScript("typeof ntReady==='function' && ntReady()", self._on_ready_probe)
+
+    def _on_ready_probe(self, ready):
+        self._player_ready = bool(ready)
+        if self._player_ready:
+            if self.loading and self.current_video_id:
+                self._load_current_video(self._pending_autoplay)
+            elif not self.current_video_id:
+                self.state.setText("Ready")
+        else:
+            QTimer.singleShot(350, self._wait_until_player_ready)
 
     def play_from_input(self):
         url = self.url.text().strip()
         if not url:
             self.state.setText("Paste a link")
             return
+        video_id = self._extract_youtube_video_id(url)
+        if not video_id:
+            self.state.setText("Invalid YouTube link")
+            self.hint.setText("Supported: youtube.com/watch, youtu.be, Shorts, Live, Embed, or a video ID.")
+            return
 
-        self._resolve_generation += 1
-        generation = self._resolve_generation
-        for resolver in self._resolver_threads:
-            resolver.requestInterruption()
-        self.loading = True
-        self.player.stop()
-        self.player.setSource(QUrl())
         db.set_setting("music_url", url)
         self.current_url = url
+        self.current_video_id = video_id
         self.track_label.setText(url)
-        self.state.setText("Downloading audio…")
+        self.loading = True
+        self._pending_autoplay = True
+        self.state.setText("Connecting to YouTube…")
         self.play_btn.setText("…")
 
-        resolver = YouTubeAudioResolver(url, generation, self)
-        resolver.resolved.connect(self._on_audio_resolved)
-        resolver.failed.connect(self._on_audio_resolve_failed)
-        resolver.progress.connect(self._on_download_progress)
-        resolver.finished.connect(self._on_resolver_finished)
-        self._resolver_threads.add(resolver)
-        resolver.start()
+        if self._player_ready:
+            self._load_current_video(True)
+        else:
+            self._wait_until_player_ready()
 
-    def _on_download_progress(self, generation, percent):
-        if generation == self._resolve_generation:
-            self.state.setText(f"Downloading audio… {percent}%")
+    def _load_current_video(self, autoplay):
+        if not self.current_video_id:
+            return
+        vid = json.dumps(self.current_video_id)
+        js = (
+            f"ntLoad({vid}, {str(bool(autoplay)).lower()}, {self.volume.value()}, "
+            f"{str(self.loop.isChecked()).lower()})"
+        )
+        self.web.page().runJavaScript(js, self._on_video_load_requested)
 
-    def _on_audio_resolved(self, generation, audio_path, title, download_dir):
-        if generation != self._resolve_generation:
-            shutil.rmtree(download_dir, ignore_errors=True)
+    def _on_video_load_requested(self, accepted):
+        if not accepted:
+            self._player_ready = False
+            self.state.setText("Waiting for YouTube…")
+            QTimer.singleShot(500, self._wait_until_player_ready)
             return
         self.loading = False
-        self._audio_temp_dirs.add(download_dir)
-        self.track_label.setText(title)
-        self.player.setSource(QUrl.fromLocalFile(audio_path))
-        self.player.play()
+        self._pending_autoplay = False
+        self.state.setText("Loading stream…")
 
-    def _on_audio_resolve_failed(self, generation, message):
-        if generation != self._resolve_generation:
+    def _poll_player_state(self):
+        if not self._player_ready:
             return
-        self.loading = False
-        self.current_url = ""
-        self.is_playing = False
-        self.play_btn.setText("▶")
-        self.state.setText("Could not load audio")
-        self.hint.setText(message)
+        self.web.page().runJavaScript("ntState()", self._on_player_state)
 
-    def _on_resolver_finished(self):
-        resolver = self.sender()
-        if resolver:
-            self._resolver_threads.discard(resolver)
-            resolver.deleteLater()
-
-    def _on_playback_state_changed(self, state):
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.is_playing = True
-            self.play_btn.setText("Ⅱ")
-            self.state.setText("Playing audio")
-        elif state == QMediaPlayer.PlaybackState.PausedState:
-            self.is_playing = False
-            self.play_btn.setText("▶")
-            self.state.setText("Paused")
-        elif not self.loading:
-            self.is_playing = False
-            self.play_btn.setText("▶")
-
-    def _on_playback_error(self, _error, message):
-        if message:
+    def _on_player_state(self, data):
+        if not isinstance(data, dict):
+            return
+        err = int(data.get("error") or 0)
+        if err:
             self.loading = False
             self.is_playing = False
             self.play_btn.setText("▶")
-            self.state.setText("Playback error")
-            self.hint.setText(message)
+            self.state.setText("YouTube playback error")
+            messages = {
+                2: "Invalid YouTube video ID.",
+                5: "This video cannot be played in the embedded player.",
+                100: "Video not found or removed.",
+                101: "The owner disabled embedded playback for this video.",
+                150: "The owner disabled embedded playback for this video.",
+            }
+            self.hint.setText(messages.get(err, f"YouTube player error {err}."))
+            return
+
+        title = str(data.get("title") or "").strip()
+        if title:
+            self.track_label.setText(title)
+        state = int(data.get("state", -99))
+        # YouTube states: -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued.
+        if state == 1:
+            self.loading = False
+            self.is_playing = True
+            self.play_btn.setText("Ⅱ")
+            self.state.setText("Playing")
+        elif state == 2:
+            self.loading = False
+            self.is_playing = False
+            self.play_btn.setText("▶")
+            self.state.setText("Paused")
+        elif state == 3:
+            self.loading = True
+            self.play_btn.setText("…")
+            self.state.setText("Buffering…")
+        elif state == 0:
+            self.loading = False
+            self.is_playing = False
+            self.play_btn.setText("▶")
+            if self.loop.isChecked() and self.current_video_id:
+                self._load_current_video(True)
+            else:
+                self.state.setText("Ended")
+        elif state == 5 and not self.loading:
+            self.state.setText("Ready")
 
     def toggle(self):
         typed = self.url.text().strip()
-
-        # New / changed link -> load it.
         if not self.current_url or typed != self.current_url:
             self.play_from_input()
             return
-
-        if self.loading:
+        if not self._player_ready:
+            self.loading = True
+            self._pending_autoplay = True
+            self._wait_until_player_ready()
             return
-
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-        elif self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
-            self.player.play()
+        if self.is_playing:
+            self.web.page().runJavaScript("ntPause()")
         else:
-            self.play_from_input()
+            self.web.page().runJavaScript("ntPlay()")
 
     def stop(self):
-        self._resolve_generation += 1
-        for resolver in self._resolver_threads:
-            resolver.requestInterruption()
         self.loading = False
-        self.player.stop()
         self.is_playing = False
+        self._pending_autoplay = False
+        if self._player_ready:
+            self.web.page().runJavaScript("ntStop()")
         self.play_btn.setText("▶")
         self.state.setText("Stopped")
 
     def set_volume(self, value):
         db.set_setting("music_volume", value / 100)
-        self.audio_output.setVolume(value / 100)
+        if self._player_ready:
+            self.web.page().runJavaScript(f"ntVolume({int(value)})")
 
     def set_loop(self, enabled):
         db.set_setting("music_loop", "1" if enabled else "0")
-        loops = QMediaPlayer.Loops.Infinite if enabled else QMediaPlayer.Loops.Once
-        self.player.setLoops(loops)
+        if self._player_ready:
+            self.web.page().runJavaScript(f"ntLoop({str(bool(enabled)).lower()})")
 
     def shutdown(self):
-        self._resolve_generation += 1
-        for resolver in self._resolver_threads:
-            resolver.requestInterruption()
-        for resolver in list(self._resolver_threads):
-            resolver.wait()
-        self.player.stop()
-        self.player.setSource(QUrl())
-        for directory in self._audio_temp_dirs:
-            shutil.rmtree(directory, ignore_errors=True)
-        self._audio_temp_dirs.clear()
+        self.poll_timer.stop()
+        if self._player_ready:
+            self.web.page().runJavaScript("ntStop()")
+        self.web.setHtml("<html></html>")
 
     def set_compact(self, compact):
         self.loop.setText("" if compact else "Loop")
-        self.url.setPlaceholderText("Music URL…" if compact else "Paste YouTube / audio link…")
+        self.url.setPlaceholderText("YouTube URL…" if compact else "Paste YouTube link…")
         self.hint.setVisible(not compact)
         self.track_label.setVisible(not compact)
 
+
+
+class FloatingTimer(QWidget):
+    """Small draggable always-on-top timer shown above other apps."""
+    def __init__(self, owner):
+        super().__init__(None)
+        self.owner = owner
+        self._drag_offset = None
+        self.setWindowTitle("NoToto Timer")
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedSize(250, 92)
+
+        outer = QFrame(self)
+        outer.setObjectName("floatingTimerCard")
+        outer.setGeometry(0, 0, 250, 92)
+        lay = QVBoxLayout(outer)
+        lay.setContentsMargins(12, 8, 10, 8)
+        lay.setSpacing(2)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self.mode_label = QLabel("FOCUS")
+        self.mode_label.setObjectName("floatingMode")
+        top.addWidget(self.mode_label)
+        top.addStretch()
+
+        self.toggle_btn = QPushButton("Ⅱ")
+        self.toggle_btn.setObjectName("floatingMiniButton")
+        self.toggle_btn.setFixedSize(28, 26)
+        self.toggle_btn.setToolTip("Pause / resume")
+        self.toggle_btn.clicked.connect(owner.toggle_timer)
+        top.addWidget(self.toggle_btn)
+
+        self.hide_btn = QPushButton("×")
+        self.hide_btn.setObjectName("floatingMiniButton")
+        self.hide_btn.setFixedSize(28, 26)
+        self.hide_btn.setToolTip("Hide on-screen timer")
+        self.hide_btn.clicked.connect(owner.disable_onscreen_timer)
+        top.addWidget(self.hide_btn)
+        lay.addLayout(top)
+
+        self.time_label = QLabel("25:00")
+        self.time_label.setObjectName("floatingTime")
+        self.time_label.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.time_label)
+
+        self.status_label = QLabel("Ready")
+        self.status_label.setObjectName("floatingStatus")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self.status_label)
+
+    def apply_theme(self, theme):
+        self.setStyleSheet(f"""
+            QFrame#floatingTimerCard {{
+                background: {theme['panel']};
+                border: 1px solid {theme['border']};
+                border-radius: 15px;
+            }}
+            QLabel#floatingMode {{ color: {theme['muted']}; font-size: 9pt; font-weight: 700; }}
+            QLabel#floatingTime {{ color: {theme['text']}; font-size: 22pt; font-weight: 800; }}
+            QLabel#floatingStatus {{ color: {theme['accent']}; font-size: 8pt; font-weight: 600; }}
+            QPushButton#floatingMiniButton {{
+                color: {theme['text']}; background: {theme['panel2']};
+                border: 1px solid {theme['border']}; border-radius: 8px;
+                font-weight: 700;
+            }}
+            QPushButton#floatingMiniButton:hover {{ background: {theme['badge']}; }}
+        """)
+
+    def sync(self, remaining, mode_text, running):
+        self.time_label.setText(fmt_timer(remaining))
+        self.mode_label.setText(mode_text)
+        self.status_label.setText("Focusing…" if running else "Paused")
+        self.toggle_btn.setText("Ⅱ" if running else "▶")
+
+    def show_finished(self, text="TIME'S UP! ✨"):
+        self.status_label.setText(text)
+        self.show()
+        self.raise_()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        self.owner.showNormal()
+        self.owner.raise_()
+        self.owner.activateWindow()
+        event.accept()
 
 
 class MainWindow(QMainWindow):
@@ -1172,6 +1450,9 @@ class MainWindow(QMainWindow):
         if self.theme_key not in THEMES:
             self.theme_key = "strawberry_night"
         self.muted = db.get_setting("muted", "0") == "1"
+        self.onscreen_enabled = db.get_setting("onscreen_timer", "1") == "1"
+        self._force_quit = False
+        self._tray_hint_shown = False
 
         self.mode = "focus"
         self.total_seconds = 25 * 60
@@ -1204,7 +1485,29 @@ class MainWindow(QMainWindow):
         self.glow_phase = 0.0
 
         self.build_ui()
+
+        self.floating_timer = FloatingTimer(self)
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(app_icon())
+        self.tray.setToolTip("NoToto — running in background")
+        self.tray.activated.connect(self._tray_activated)
+
+        tray_menu = QMenu(self)
+        open_action = QAction("Open NoToto", self)
+        open_action.triggered.connect(self.restore_from_tray)
+        tray_menu.addAction(open_action)
+        tray_menu.addSeparator()
+        quit_action = QAction("Quit NoToto", self)
+        quit_action.triggered.connect(self.quit_from_tray)
+        tray_menu.addAction(quit_action)
+        self.tray.setContextMenu(tray_menu)
+
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
+
         self.apply_theme()
+        if self.onscreen_enabled:
+            self.floating_timer.show()
         self.reload_tasks()
         self.refresh_stats()
         self.refresh_timer()
@@ -1376,6 +1679,14 @@ class MainWindow(QMainWindow):
         self.start_btn.setObjectName("compactPrimary")
         self.start_btn.clicked.connect(self.toggle_timer)
         controls.addWidget(self.start_btn)
+
+        self.onscreen_btn = QPushButton("📌")
+        self.onscreen_btn.setObjectName("iconControl")
+        self.onscreen_btn.setCheckable(True)
+        self.onscreen_btn.setChecked(self.onscreen_enabled)
+        self.onscreen_btn.setToolTip("Keep timer on screen")
+        self.onscreen_btn.clicked.connect(self.toggle_onscreen_timer)
+        controls.addWidget(self.onscreen_btn)
 
         self.stop_btn = QPushButton("■")
         self.stop_btn.setObjectName("iconControl")
@@ -1650,6 +1961,8 @@ class MainWindow(QMainWindow):
         #successText {{ color:{t['accent_hover']}; font-weight:800; }}
         """)
         self.ring.set_values(self.remaining, self.total_seconds, t["accent"])
+        if hasattr(self, "floating_timer"):
+            self.floating_timer.apply_theme(t)
 
 
     def resizeEvent(self, event):
@@ -1836,6 +2149,69 @@ class MainWindow(QMainWindow):
         self.active_task_id = self.active_combo.currentData()
         self.reload_tasks()
 
+    def toggle_onscreen_timer(self):
+        self.onscreen_enabled = bool(self.onscreen_btn.isChecked())
+        db.set_setting("onscreen_timer", "1" if self.onscreen_enabled else "0")
+        if self.onscreen_enabled:
+            self.floating_timer.show()
+            self.floating_timer.raise_()
+            self.refresh_timer()
+        else:
+            self.floating_timer.hide()
+
+    def disable_onscreen_timer(self):
+        self.onscreen_enabled = False
+        db.set_setting("onscreen_timer", "0")
+        self.onscreen_btn.blockSignals(True)
+        self.onscreen_btn.setChecked(False)
+        self.onscreen_btn.blockSignals(False)
+        self.floating_timer.hide()
+
+    def restore_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.restore_from_tray()
+
+    def quit_from_tray(self):
+        self._force_quit = True
+        if hasattr(self, "music_panel"):
+            self.music_panel.shutdown()
+        if hasattr(self, "floating_timer"):
+            self.floating_timer.hide()
+        if hasattr(self, "tray"):
+            self.tray.hide()
+        QApplication.quit()
+
+    def _play_finish_chime(self):
+        """Three short, spaced system chimes: noticeable without being continuous."""
+        if self.muted:
+            return
+        QApplication.beep()
+        QTimer.singleShot(280, QApplication.beep)
+        QTimer.singleShot(560, QApplication.beep)
+
+    def notify_timer_finished(self):
+        focus_done = self.mode in ("focus", "custom")
+        message = (
+            "Focus session finished. Time for a break ✨"
+            if focus_done
+            else "Break finished. Ready for the next round? 🍅"
+        )
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.showMessage(
+                "NoToto — Time's up!",
+                message,
+                QSystemTrayIcon.Information,
+                10000,
+            )
+        if self.onscreen_enabled:
+            self.floating_timer.show_finished()
+        self._play_finish_chime()
+
     def set_mode(self, mode):
         self.timer.stop()
         self.glow_timer.stop()
@@ -1945,8 +2321,7 @@ class MainWindow(QMainWindow):
         self.remaining = self.total_seconds
         self.start_btn.setText("▶ Start")
         if auto:
-            if not self.muted:
-                QApplication.beep()
+            self.notify_timer_finished()
             self.alert.setText("🏆 Quest round cleared! Nice work ✨")
             self.confetti()
         else:
@@ -1970,6 +2345,8 @@ class MainWindow(QMainWindow):
     def refresh_timer(self):
         self.timer_text.setText(fmt_timer(self.remaining))
         self.ring.set_values(self.remaining, self.total_seconds, THEMES[self.theme_key]["accent"])
+        if hasattr(self, "floating_timer"):
+            self.floating_timer.sync(self.remaining, self.mode_text.text(), self.running)
 
     def toggle_mute(self):
         self.muted = not self.muted
@@ -2011,6 +2388,22 @@ class MainWindow(QMainWindow):
 
 
     def closeEvent(self, event):
+        # Clicking the window X keeps NoToto alive in the system tray so the
+        # focus timer, reminders and audio can continue in the background.
+        if not self._force_quit and QSystemTrayIcon.isSystemTrayAvailable():
+            event.ignore()
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage(
+                    "NoToto is still running",
+                    "Timer and reminders will keep running in the background. "
+                    "Click the tray icon to reopen, or right-click it to quit.",
+                    QSystemTrayIcon.Information,
+                    4500,
+                )
+            return
+
         if hasattr(self, "music_panel"):
             self.music_panel.shutdown()
         super().closeEvent(event)
@@ -2020,6 +2413,9 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
+    app.setWindowIcon(app_icon())
+    app.setQuitOnLastWindowClosed(False)
     w = MainWindow()
+    w.setWindowIcon(app_icon())
     w.show()
     sys.exit(app.exec())

@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 APP_NAME = "NoToto"
@@ -66,6 +67,15 @@ def init_db():
         """)
         _add_column_if_missing(conn, "tasks", "priority", "TEXT NOT NULL DEFAULT 'medium'")
         _add_column_if_missing(conn, "tasks", "category", "TEXT NOT NULL DEFAULT 'Study'")
+        _add_column_if_missing(conn, "tasks", "task_date", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, "tasks", "start_date", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, "tasks", "end_date", "TEXT NOT NULL DEFAULT ''")
+        # Backward-compatible migration: old single task_date becomes both ends
+        # of the range. Tasks with no date default to today's local calendar date.
+        today = datetime.now().date().isoformat()
+        conn.execute("UPDATE tasks SET task_date=? WHERE task_date IS NULL OR TRIM(task_date)=''", (today,))
+        conn.execute("UPDATE tasks SET start_date=task_date WHERE start_date IS NULL OR TRIM(start_date)=''")
+        conn.execute("UPDATE tasks SET end_date=start_date WHERE end_date IS NULL OR TRIM(end_date)=''")
 
 def list_tasks():
     with connect() as conn:
@@ -103,16 +113,16 @@ def toggle_subtask(subtask_id):
             (subtask_id,),
         )
 
-def add_task(title, start_time, end_time, estimated_minutes, worked_seconds,
+def add_task(title, start_date, end_date, start_time, end_time, estimated_minutes, worked_seconds,
              completed=False, priority="medium", category="Study", subtasks=None):
     with connect() as conn:
         cur = conn.execute("""
             INSERT INTO tasks(
-                title,start_time,end_time,estimated_minutes,worked_seconds,
+                title,task_date,start_date,end_date,start_time,end_time,estimated_minutes,worked_seconds,
                 completed,priority,category,completed_at
-            ) VALUES(?,?,?,?,?,?,?,?,CASE WHEN ?=1 THEN CURRENT_TIMESTAMP ELSE NULL END)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,CASE WHEN ?=1 THEN CURRENT_TIMESTAMP ELSE NULL END)
         """, (
-            title, start_time, end_time, int(estimated_minutes), int(worked_seconds),
+            title, start_date, start_date, end_date, start_time, end_time, int(estimated_minutes), int(worked_seconds),
             1 if completed else 0, priority, category, 1 if completed else 0
         ))
         task_id = cur.lastrowid
@@ -121,12 +131,12 @@ def add_task(title, start_time, end_time, estimated_minutes, worked_seconds,
         save_subtasks(task_id, subtasks)
     return task_id
 
-def update_task(task_id, title, start_time, end_time, estimated_minutes,
+def update_task(task_id, title, start_date, end_date, start_time, end_time, estimated_minutes,
                 worked_seconds, completed, priority, category, subtasks=None):
     with connect() as conn:
         conn.execute("""
             UPDATE tasks SET
-                title=?, start_time=?, end_time=?,
+                title=?, task_date=?, start_date=?, end_date=?, start_time=?, end_time=?,
                 estimated_minutes=?, worked_seconds=?,
                 completed=?, priority=?, category=?,
                 completed_at=CASE
@@ -136,7 +146,7 @@ def update_task(task_id, title, start_time, end_time, estimated_minutes,
                 END
             WHERE id=?
         """, (
-            title, start_time, end_time, int(estimated_minutes), int(worked_seconds),
+            title, start_date, start_date, end_date, start_time, end_time, int(estimated_minutes), int(worked_seconds),
             1 if completed else 0, priority, category,
             1 if completed else 0, 1 if completed else 0, task_id
         ))
