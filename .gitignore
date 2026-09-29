@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+env/
+
+/build/
+/dist/
+/*.spec
+
+# Local SQLite data and journal files
+nototo.db
+nototo.db-*
+nototo.sqlite3
